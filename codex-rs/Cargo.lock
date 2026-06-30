@@ -3683,7 +3683,6 @@ dependencies = [
  "anyhow",
  "codex-context-fragments",
  "codex-execpolicy",
- "codex-git-utils",
  "codex-protocol",
  "codex-utils-absolute-path",
  "codex-utils-template",

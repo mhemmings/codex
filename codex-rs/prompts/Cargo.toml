@@ -15,7 +15,6 @@ workspace = true
 [dependencies]
 anyhow = { workspace = true }
 codex-context-fragments = { workspace = true }
-codex-git-utils = { workspace = true }
 codex-execpolicy = { workspace = true }
 codex-protocol = { workspace = true }
 codex-utils-absolute-path = { workspace = true }

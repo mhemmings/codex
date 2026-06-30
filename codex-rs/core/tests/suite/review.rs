@@ -23,7 +23,6 @@ use core_test_support::responses::ResponseMock;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
-use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
@@ -765,71 +764,23 @@ async fn review_history_surfaces_in_parent_session() {
     server.verify().await;
 }
 
-/// `/review` should use the session's current cwd (including runtime overrides)
-/// when resolving base-branch review prompts (merge-base computation).
+/// `/review` should defer base-branch merge-base computation to the agent turn.
+/// Embedding a precomputed SHA in the prompt can go stale if refs move before
+/// the review starts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn review_uses_overridden_cwd_for_base_branch_merge_base() {
+async fn review_base_branch_prompt_computes_merge_base_at_turn_time() {
     skip_if_no_network!();
 
     let (server, request_log) =
         start_responses_server_with_sse(completed_sse(), /*expected_requests*/ 1).await;
 
-    let initial_cwd = TempDir::new().unwrap();
-
-    let repo_dir = TempDir::new().unwrap();
-    let repo_path = repo_dir.path();
-
-    fn run_git(repo_path: &std::path::Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(repo_path)
-            .args(args)
-            .output()
-            .expect("spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed: stdout={:?} stderr={:?}",
-            args,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    run_git(repo_path, &["init", "-b", "main"]);
-    run_git(repo_path, &["config", "user.email", "test@example.com"]);
-    run_git(repo_path, &["config", "user.name", "Test User"]);
-    std::fs::write(repo_path.join("file.txt"), "hello\n").unwrap();
-    run_git(repo_path, &["add", "."]);
-    run_git(repo_path, &["commit", "-m", "initial"]);
-
-    let head_sha = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo_path)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .expect("rev-parse HEAD");
-    assert!(head_sha.status.success());
-    let head_sha = String::from_utf8(head_sha.stdout)
-        .expect("utf8 sha")
-        .trim()
-        .to_string();
-
     let codex_home = Arc::new(TempDir::new().unwrap());
+    let initial_cwd = TempDir::new().unwrap();
     let initial_cwd_path = initial_cwd.path().to_path_buf();
     let codex = new_conversation_for_server(&server, codex_home.clone(), move |config| {
         config.cwd = initial_cwd_path.abs();
     })
     .await;
-
-    core_test_support::submit_thread_settings(
-        &codex,
-        codex_protocol::protocol::ThreadSettingsOverrides {
-            environments: Some(local_selections(repo_path.to_path_buf().abs())),
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
 
     codex
         .submit(Op::Review {
@@ -854,13 +805,19 @@ async fn review_uses_overridden_cwd_for_base_branch_merge_base() {
     let body = requests[0].body_json();
     let input = body["input"].as_array().expect("input array");
 
-    let saw_merge_base_sha = input
+    let prompt_text = input
         .iter()
         .filter_map(|msg| msg["content"][0]["text"].as_str())
-        .any(|text| text.contains(&head_sha));
+        .find(|text| text.contains("Review the code changes against the base branch 'main'."))
+        .expect("review prompt should be present");
+
     assert!(
-        saw_merge_base_sha,
-        "expected review prompt to include merge-base sha {head_sha}"
+        prompt_text.contains("MERGE_BASE=$(git merge-base HEAD \"main\")"),
+        "expected review prompt to ask for a fresh merge-base computation"
+    );
+    assert!(
+        !prompt_text.contains("The merge base commit for this comparison is"),
+        "review prompt should not include a precomputed merge-base SHA"
     );
 
     let _codex_home_guard = codex_home;
